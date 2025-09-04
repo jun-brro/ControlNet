@@ -75,6 +75,14 @@ class DDIMSampler(object):
                unconditional_conditioning=None, # this has to come in the same format as the conditioning, # e.g. as encoded tokens, ...
                dynamic_threshold=None,
                ucg_schedule=None,
+               # --- Optional mask-aware & regional controls ---
+               mask_soft=None,
+               regional_cfg=None,           # dict with keys: {"mask": Tensor[B,1,H,W], "scale_inside": float, "scale_outside": float}
+               regional_noise=None,         # dict with keys: {"mask": Tensor[B,1,H,W], "mult_inside": float, "mult_outside": float}
+               use_inversion_start=False,   # start from DDIM encode(x0, t_enc)
+               t_enc=None,                  # integer number of DDIM steps for inversion
+               t_enc_ratio=None,            # ratio in [0,1] of S for inversion
+               repaint_cfg=None,            # dict: {"enabled": bool, "jump": int, "every_k": int}
                **kwargs
                ):
         if conditioning is not None:
@@ -100,6 +108,22 @@ class DDIMSampler(object):
         size = (batch_size, C, H, W)
         print(f'Data shape for DDIM sampling is {size}, eta {eta}')
 
+        # Optional: DDIM inversion start from x0 up to t_enc
+        if use_inversion_start and (x0 is not None) and (conditioning is not None):
+            try:
+                total_steps = self.ddim_timesteps.shape[0]
+                if t_enc is None:
+                    if t_enc_ratio is None:
+                        t_enc = int(0.5 * float(total_steps))
+                    else:
+                        t_enc = int(np.clip(round(float(t_enc_ratio) * float(total_steps)), 0, total_steps))
+                t_enc = int(np.clip(t_enc, 0, total_steps))
+                x_T, _ = self.encode(x0, conditioning, t_enc, use_original_steps=False,
+                                     unconditional_guidance_scale=unconditional_guidance_scale,
+                                     unconditional_conditioning=unconditional_conditioning)
+            except Exception as e:
+                print(f"[DDIMSampler] Inversion start failed, falling back to default x_T. Reason: {e}")
+
         samples, intermediates = self.ddim_sampling(conditioning, size,
                                                     callback=callback,
                                                     img_callback=img_callback,
@@ -115,7 +139,12 @@ class DDIMSampler(object):
                                                     unconditional_guidance_scale=unconditional_guidance_scale,
                                                     unconditional_conditioning=unconditional_conditioning,
                                                     dynamic_threshold=dynamic_threshold,
-                                                    ucg_schedule=ucg_schedule
+                                                    ucg_schedule=ucg_schedule,
+                                                    # pass through optional controls
+                                                    mask_soft=mask_soft,
+                                                    regional_cfg=regional_cfg,
+                                                    regional_noise=regional_noise,
+                                                    repaint_cfg=repaint_cfg
                                                     )
         return samples, intermediates
 
@@ -126,7 +155,12 @@ class DDIMSampler(object):
                       mask=None, x0=None, img_callback=None, log_every_t=100,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None, dynamic_threshold=None,
-                      ucg_schedule=None):
+                      ucg_schedule=None,
+                      # optional controls
+                      mask_soft=None,
+                      regional_cfg=None,
+                      regional_noise=None,
+                      repaint_cfg=None):
         device = self.model.betas.device
         b = shape[0]
         if x_T is None:
@@ -147,14 +181,40 @@ class DDIMSampler(object):
 
         iterator = tqdm(time_range, desc='DDIM Sampler', total=total_steps)
 
+        # Precompute per-step constants to reduce small allocations in the hot loop (DDIM path)
+        precomputed = None
+        if not ddim_use_original_steps:
+            a_t_all = self.ddim_alphas.view(-1, 1, 1, 1).to(device)
+            a_prev_all = self.ddim_alphas_prev.view(-1, 1, 1, 1).to(device)
+            sigma_all = self.ddim_sigmas.view(-1, 1, 1, 1).to(device)
+            sqrt_oneminus_all = self.ddim_sqrt_one_minus_alphas.view(-1, 1, 1, 1).to(device)
+            precomputed = (a_t_all, a_prev_all, sigma_all, sqrt_oneminus_all)
+
         for i, step in enumerate(iterator):
             index = total_steps - i - 1
             ts = torch.full((b,), step, device=device, dtype=torch.long)
 
-            if mask is not None:
+            # Determine the active keep-mask (outside=1, inside=0)
+            active_mask = mask_soft if mask_soft is not None else mask
+
+            # Optional RePaint-style re-noise inside the edit region before denoising
+            if repaint_cfg is not None and repaint_cfg.get('enabled', False) and (x0 is not None) and (active_mask is not None):
+                every_k = int(repaint_cfg.get('every_k', 0))
+                jump = int(repaint_cfg.get('jump', 0))
+                if every_k > 0 and jump > 0 and (i % every_k == 0):
+                    index_jump = min(index + jump, total_steps - 1)
+                    step_jump = self.ddim_timesteps[index_jump]
+                    ts_jump = torch.full((b,), int(step_jump), device=device, dtype=torch.long)
+                    img_jump = self.model.q_sample(x0, ts_jump)
+                    # edit mask (inside=1)
+                    edit_mask = 1.0 - active_mask
+                    img = img_jump * edit_mask + img * (1.0 - edit_mask)
+
+            # Lock outside region to the forward diffusion path at current ts
+            if active_mask is not None:
                 assert x0 is not None
-                img_orig = self.model.q_sample(x0, ts)  # TODO: deterministic forward pass?
-                img = img_orig * mask + (1. - mask) * img
+                img_orig = self.model.q_sample(x0, ts)
+                img = img_orig * active_mask + (1. - active_mask) * img
 
             if ucg_schedule is not None:
                 assert len(ucg_schedule) == len(time_range)
@@ -166,7 +226,11 @@ class DDIMSampler(object):
                                       corrector_kwargs=corrector_kwargs,
                                       unconditional_guidance_scale=unconditional_guidance_scale,
                                       unconditional_conditioning=unconditional_conditioning,
-                                      dynamic_threshold=dynamic_threshold)
+                                      dynamic_threshold=dynamic_threshold,
+                                      regional_cfg=regional_cfg,
+                                      regional_noise=regional_noise,
+                                      mask_soft=active_mask,
+                                      precomputed=precomputed)
             img, pred_x0 = outs
             if callback: callback(i)
             if img_callback: img_callback(pred_x0, i)
@@ -181,15 +245,48 @@ class DDIMSampler(object):
     def p_sample_ddim(self, x, c, t, index, repeat_noise=False, use_original_steps=False, quantize_denoised=False,
                       temperature=1., noise_dropout=0., score_corrector=None, corrector_kwargs=None,
                       unconditional_guidance_scale=1., unconditional_conditioning=None,
-                      dynamic_threshold=None):
+                      dynamic_threshold=None,
+                      regional_cfg=None,
+                      regional_noise=None,
+                      mask_soft=None,
+                      precomputed=None):
         b, *_, device = *x.shape, x.device
 
         if unconditional_conditioning is None or unconditional_guidance_scale == 1.:
             model_output = self.model.apply_model(x, t, c)
         else:
-            model_t = self.model.apply_model(x, t, c)
-            model_uncond = self.model.apply_model(x, t, unconditional_conditioning)
-            model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
+            # If no ControlNet hint is used, we can fuse unconditional + conditional in a single forward
+            can_fuse = isinstance(c, dict) and (c.get('c_concat', None) is None) and isinstance(unconditional_conditioning, dict) and (unconditional_conditioning.get('c_concat', None) is None)
+            if can_fuse:
+                x_in = torch.cat([x, x], dim=0)
+                t_in = torch.cat([t, t], dim=0)
+                # Concatenate cross-attn contexts along batch
+                cond_fused = {
+                    'c_crossattn': [torch.cat([unconditional_conditioning['c_crossattn'][0], c['c_crossattn'][0]], dim=0)],
+                    'c_concat': None
+                }
+                model_uncond, model_t = torch.chunk(self.model.apply_model(x_in, t_in, cond_fused), 2, dim=0)
+            else:
+                model_t = self.model.apply_model(x, t, c)
+                model_uncond = self.model.apply_model(x, t, unconditional_conditioning)
+
+            # Regional CFG: per-pixel scale using inside-mask
+            if regional_cfg is not None and ('scale_inside' in regional_cfg) and ('scale_outside' in regional_cfg):
+                m_inside = regional_cfg.get('mask', None)
+                if m_inside is None and mask_soft is not None:
+                    # derive inside mask from keep-mask if provided
+                    m_inside = 1.0 - mask_soft
+                if m_inside is not None:
+                    s_in = float(regional_cfg['scale_inside'])
+                    s_out = float(regional_cfg['scale_outside'])
+                    s_map = s_out + m_inside * (s_in - s_out)
+                    if s_map.shape[1] == 1 and model_t.shape[1] != 1:
+                        s_map = s_map.expand(-1, model_t.shape[1], -1, -1)
+                    model_output = model_uncond + s_map * (model_t - model_uncond)
+                else:
+                    model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
+            else:
+                model_output = model_uncond + unconditional_guidance_scale * (model_t - model_uncond)
 
         if self.model.parameterization == "v":
             e_t = self.model.predict_eps_from_z_and_v(x, t, model_output)
@@ -200,15 +297,21 @@ class DDIMSampler(object):
             assert self.model.parameterization == "eps", 'not implemented'
             e_t = score_corrector.modify_score(self.model, e_t, x, t, c, **corrector_kwargs)
 
-        alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
-        alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
-        sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
-        sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
-        # select parameters corresponding to the currently considered timestep
-        a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
-        a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
-        sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
-        sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index],device=device)
+        if (precomputed is not None) and (not use_original_steps):
+            a_t = precomputed[0][index]
+            a_prev = precomputed[1][index]
+            sigma_t = precomputed[2][index]
+            sqrt_one_minus_at = precomputed[3][index]
+        else:
+            alphas = self.model.alphas_cumprod if use_original_steps else self.ddim_alphas
+            alphas_prev = self.model.alphas_cumprod_prev if use_original_steps else self.ddim_alphas_prev
+            sqrt_one_minus_alphas = self.model.sqrt_one_minus_alphas_cumprod if use_original_steps else self.ddim_sqrt_one_minus_alphas
+            sigmas = self.model.ddim_sigmas_for_original_num_steps if use_original_steps else self.ddim_sigmas
+            # select parameters corresponding to the currently considered timestep
+            a_t = torch.full((b, 1, 1, 1), alphas[index], device=device)
+            a_prev = torch.full((b, 1, 1, 1), alphas_prev[index], device=device)
+            sigma_t = torch.full((b, 1, 1, 1), sigmas[index], device=device)
+            sqrt_one_minus_at = torch.full((b, 1, 1, 1), sqrt_one_minus_alphas[index], device=device)
 
         # current prediction for x_0
         if self.model.parameterization != "v":
@@ -224,7 +327,23 @@ class DDIMSampler(object):
 
         # direction pointing to x_t
         dir_xt = (1. - a_prev - sigma_t**2).sqrt() * e_t
-        noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
+        base_noise = sigma_t * noise_like(x.shape, device, repeat_noise) * temperature
+        # Regional noise multiplier inside/outside
+        if regional_noise is not None and (('mult_inside' in regional_noise) and ('mult_outside' in regional_noise)):
+            m_inside = regional_noise.get('mask', None)
+            if m_inside is None and mask_soft is not None:
+                m_inside = 1.0 - mask_soft
+            if m_inside is not None:
+                k_in = float(regional_noise['mult_inside'])
+                k_out = float(regional_noise['mult_outside'])
+                k_map = k_out + m_inside * (k_in - k_out)
+                if k_map.shape[1] == 1 and base_noise.shape[1] != 1:
+                    k_map = k_map.expand(-1, base_noise.shape[1], -1, -1)
+                noise = k_map * base_noise
+            else:
+                noise = base_noise
+        else:
+            noise = base_noise
         if noise_dropout > 0.:
             noise = torch.nn.functional.dropout(noise, p=noise_dropout)
         x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise

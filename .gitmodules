@@ -1,0 +1,3 @@
+[submodule "LanPaint"]
+	path = LanPaint
+	url = https://github.com/scraed/LanPaint

@@ -16,6 +16,12 @@ try:
 except:
     XFORMERS_IS_AVAILBLE = False
 
+# PyTorch SDPA (Flash/Math) availability
+try:
+    SDPA_IS_AVAILABLE = hasattr(F, 'scaled_dot_product_attention')
+except Exception:
+    SDPA_IS_AVAILABLE = False
+
 # CrossAttn precision handling
 import os
 _ATTN_PRECISION = os.environ.get("ATTN_PRECISION", "fp32")
@@ -243,15 +249,57 @@ class MemoryEfficientCrossAttention(nn.Module):
         return self.to_out(out)
 
 
+class SdpaCrossAttention(nn.Module):
+    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
+        super().__init__()
+        inner_dim = dim_head * heads
+        context_dim = default(context_dim, query_dim)
+
+        self.heads = heads
+        self.dim_head = dim_head
+
+        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
+        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
+        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
+
+        self.to_out = nn.Sequential(nn.Linear(inner_dim, query_dim), nn.Dropout(dropout))
+
+    def forward(self, x, context=None, mask=None):
+        q = self.to_q(x)
+        context = default(context, x)
+        k = self.to_k(context)
+        v = self.to_v(context)
+
+        b, n, _ = q.shape
+        h = self.heads
+        d = self.dim_head
+
+        q = q.view(b, n, h, d).permute(0, 2, 1, 3)
+        k = k.view(b, -1, h, d).permute(0, 2, 1, 3)
+        v = v.view(b, -1, h, d).permute(0, 2, 1, 3)
+
+        # SDPA handles scaling internally
+        # Prefer flash/mem-efficient kernels when available
+        if torch.cuda.is_available():
+            with torch.backends.cuda.sdp_kernel(enable_flash=True, enable_math=True, enable_mem_efficient=True):
+                out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+        else:
+            out = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False)
+
+        out = out.permute(0, 2, 1, 3).contiguous().view(b, n, h * d)
+        return self.to_out(out)
+
+
 class BasicTransformerBlock(nn.Module):
     ATTENTION_MODES = {
         "softmax": CrossAttention,  # vanilla attention
-        "softmax-xformers": MemoryEfficientCrossAttention
+        "softmax-xformers": MemoryEfficientCrossAttention,
+        "sdpa": SdpaCrossAttention
     }
     def __init__(self, dim, n_heads, d_head, dropout=0., context_dim=None, gated_ff=True, checkpoint=True,
                  disable_self_attn=False):
         super().__init__()
-        attn_mode = "softmax-xformers" if XFORMERS_IS_AVAILBLE else "softmax"
+        attn_mode = "softmax-xformers" if XFORMERS_IS_AVAILBLE else ("sdpa" if SDPA_IS_AVAILABLE else "softmax")
         assert attn_mode in self.ATTENTION_MODES
         attn_cls = self.ATTENTION_MODES[attn_mode]
         self.disable_self_attn = disable_self_attn

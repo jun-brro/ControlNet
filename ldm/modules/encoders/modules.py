@@ -96,6 +96,16 @@ class FrozenCLIPEmbedder(AbstractEncoder):
                  freeze=True, layer="last", layer_idx=None):  # clip-vit-base-patch32
         super().__init__()
         assert layer in self.LAYERS
+        # Try local path first, fallback to HuggingFace
+        if version == "openai/clip-vit-large-patch14":
+            import os
+            local_path = "./models/clip-vit-large-patch14"
+            # Check if local model has pytorch_model.bin (complete model)
+            if os.path.exists(local_path) and os.path.exists(os.path.join(local_path, "pytorch_model.bin")):
+                print(f"Using local CLIP model from {local_path}")
+                version = local_path
+            else:
+                print(f"Local CLIP model incomplete or missing pytorch_model.bin, using HuggingFace: {version}")
         self.tokenizer = CLIPTokenizer.from_pretrained(version)
         self.transformer = CLIPTextModel.from_pretrained(version)
         self.device = device

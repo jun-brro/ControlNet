@@ -313,6 +313,33 @@ class ControlLDM(LatentDiffusion):
         self.control_key = control_key
         self.only_mid_control = only_mid_control
         self.control_scales = [1.0] * 13
+        # optional device map for model-parallel inference
+        self.device_map = None  # dict keys: 'unet', 'control', 'vae', 'clip' -> torch.device or str
+
+    def set_device_map(self, device_map):
+        """Assign submodules to devices for model-parallel inference.
+        device_map example: {
+          'unet': 'cuda:0', 'control': 'cuda:1', 'vae': 'cuda:2', 'clip': 'cuda:3'
+        }
+        """
+        self.device_map = {}
+        for k, v in (device_map or {}).items():
+            self.device_map[k] = torch.device(v) if not isinstance(v, torch.device) else v
+        # Move submodules lazily; actual movement is lightweight here
+        if 'unet' in self.device_map and hasattr(self.model, 'diffusion_model'):
+            self.model.diffusion_model.to(self.device_map['unet'])
+        if 'control' in self.device_map and self.control_model is not None:
+            self.control_model.to(self.device_map['control'])
+        if 'vae' in self.device_map and hasattr(self, 'first_stage_model'):
+            self.first_stage_model.to(self.device_map['vae'])
+        if 'clip' in self.device_map and hasattr(self, 'cond_stage_model'):
+            self.cond_stage_model.to(self.device_map['clip'])
+            # many encoders keep their own device field
+            if hasattr(self.cond_stage_model, 'device'):
+                self.cond_stage_model.device = self.device_map['clip']
+        # base device is the unet device for schedules/sampler buffers
+        if 'unet' in self.device_map:
+            self.device = self.device_map['unet']
 
     @torch.no_grad()
     def get_input(self, batch, k, bs=None, *args, **kwargs):
@@ -329,15 +356,71 @@ class ControlLDM(LatentDiffusion):
         assert isinstance(cond, dict)
         diffusion_model = self.model.diffusion_model
 
+        # resolve devices
+        unet_device = self.device_map['unet'] if (self.device_map and 'unet' in self.device_map) else x_noisy.device
+        control_device = self.device_map['control'] if (self.device_map and 'control' in self.device_map) else unet_device
+
         cond_txt = torch.cat(cond['c_crossattn'], 1)
+        if cond_txt.device != unet_device:
+            cond_txt = cond_txt.to(unet_device)
+        # align context dtype with UNet weights to avoid matmul dtype mismatches
+        try:
+            unet_dtype = next(diffusion_model.parameters()).dtype
+            if cond_txt.dtype != unet_dtype:
+                cond_txt = cond_txt.to(dtype=unet_dtype)
+        except StopIteration:
+            pass
+        # ensure timestep is on proper device for each sub-call later
 
         if cond['c_concat'] is None:
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
+            if x_noisy.device != unet_device:
+                x_unet = x_noisy.to(unet_device)
+                t_unet = t.to(unet_device)
+            else:
+                x_unet = x_noisy
+                t_unet = t
+            eps = diffusion_model(x=x_unet, timesteps=t_unet, context=cond_txt, control=None, only_mid_control=self.only_mid_control)
         else:
-            control = self.control_model(x=x_noisy, hint=torch.cat(cond['c_concat'], 1), timesteps=t, context=cond_txt)
+            # move inputs for control to control_device
+            x_ctrl = x_noisy if x_noisy.device == control_device else x_noisy.to(control_device)
+            t_ctrl = t if t.device == control_device else t.to(control_device)
+            hint = torch.cat(cond['c_concat'], 1)
+            if hint.device != control_device:
+                hint = hint.to(control_device)
+            # align control hint/context dtype with control model
+            try:
+                ctrl_dtype = getattr(self.control_model, 'dtype', None)
+                if ctrl_dtype is None:
+                    ctrl_dtype = x_ctrl.dtype
+                if hint.dtype != ctrl_dtype:
+                    hint = hint.to(dtype=ctrl_dtype)
+            except Exception:
+                pass
+            cond_txt_ctrl = cond_txt if cond_txt.device == control_device else cond_txt.to(control_device)
+            try:
+                ctrl_dtype = getattr(self.control_model, 'dtype', None)
+                if ctrl_dtype is None:
+                    ctrl_dtype = x_ctrl.dtype
+                if cond_txt_ctrl.dtype != ctrl_dtype:
+                    cond_txt_ctrl = cond_txt_ctrl.to(dtype=ctrl_dtype)
+            except Exception:
+                pass
+            control = self.control_model(x=x_ctrl, hint=hint, timesteps=t_ctrl, context=cond_txt_ctrl)
+            # scale and bring control to unet device
             control = [c * scale for c, scale in zip(control, self.control_scales)]
-            eps = diffusion_model(x=x_noisy, timesteps=t, context=cond_txt, control=control, only_mid_control=self.only_mid_control)
+            control = [c.to(unet_device) if c.device != unet_device else c for c in control]
+            # ensure control dtype matches UNet dtype to avoid add/cat dtype errors
+            try:
+                unet_dtype = next(diffusion_model.parameters()).dtype
+                control = [c.to(dtype=unet_dtype) if c.dtype != unet_dtype else c for c in control]
+            except StopIteration:
+                pass
+            # move x and t to unet device for the main UNet forward
+            x_unet = x_noisy if x_noisy.device == unet_device else x_noisy.to(unet_device)
+            t_unet = t if t.device == unet_device else t.to(unet_device)
+            eps = diffusion_model(x=x_unet, timesteps=t_unet, context=cond_txt if cond_txt.device==unet_device else cond_txt.to(unet_device), control=control, only_mid_control=self.only_mid_control)
 
+        # return eps on the same device as the UNet output; sampler handles device consistency
         return eps
 
     @torch.no_grad()
